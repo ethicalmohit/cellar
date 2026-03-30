@@ -1,11 +1,12 @@
 package ui
 
 import (
-	"github.com/mohit/cellar/data"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/mohit/cellar/data"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
@@ -26,9 +27,11 @@ const (
 	tabCasks
 	tabApps
 	tabVulns
+	tabServices
+	tabTaps
 )
 
-var tabNames = []string{"Formulae", "Casks", "Apps", "Vulnerabilities"}
+var tabNames = []string{"Formulae", "Casks", "Apps", "Vulnerabilities", "Services", "Taps"}
 
 type uiMode int
 
@@ -40,6 +43,8 @@ const (
 	modeDeps
 	modeUpgrading
 	modeUninstalling
+	modeServiceAction
+	modeServiceRunning
 )
 
 type confirmAction int
@@ -51,7 +56,7 @@ const (
 
 type tabState struct {
 	filter  string
-	sortCol int // -1 = no sort
+	sortCol int
 	sortAsc bool
 }
 
@@ -62,18 +67,19 @@ type tabState struct {
 type formulaeLoadedMsg []data.Package
 type casksLoadedMsg []data.Package
 type appsLoadedMsg []data.App
+type servicesLoadedMsg []data.Service
+type tapsLoadedMsg []data.Tap
 type vulnsLoadedMsg struct {
 	formulae []data.Package
 	casks    []data.Package
 }
 type depsLoadedMsg data.DepInfo
-type upgradeDoneMsg struct {
-	name string
-	err  error
-}
-type uninstallDoneMsg struct {
-	name string
-	err  error
+type upgradeDoneMsg struct{ name string; err error }
+type uninstallDoneMsg struct{ name string; err error }
+type serviceActionDoneMsg struct {
+	name   string
+	action string
+	err    error
 }
 type errMsg struct{ err error }
 
@@ -82,9 +88,9 @@ type errMsg struct{ err error }
 // ---------------------------------------------------------------------------
 
 type Model struct {
-	activeTab tab
-	width     int
-	height    int
+	activeTab    tab
+	width        int
+	height       int
 	loading      bool
 	vulnsLoading bool
 	lastScan     time.Time
@@ -93,13 +99,17 @@ type Model struct {
 	formulae []data.Package
 	casks    []data.Package
 	apps     []data.App
+	services []data.Service
+	taps     []data.Tap
 
-	fTable table.Model
-	cTable table.Model
-	aTable table.Model
-	vTable table.Model
+	fTable   table.Model
+	cTable   table.Model
+	aTable   table.Model
+	vTable   table.Model
+	svcTable table.Model
+	tTable   table.Model
 
-	tabStates [4]tabState
+	tabStates [6]tabState
 
 	mode uiMode
 
@@ -110,7 +120,10 @@ type Model struct {
 	confirmFrom   string
 	confirmTo     string
 	confirmAction confirmAction
-	actionMsg     string
+
+	// service action
+	selectedSvc string
+	actionMsg   string
 
 	// deps panel
 	depsViewport viewport.Model
@@ -131,22 +144,22 @@ func New() Model {
 	fi.Placeholder = "type to filter…"
 	fi.CharLimit = 64
 
-	states := [4]tabState{}
+	states := [6]tabState{}
 	for i := range states {
 		states[i].sortCol = -1
 		states[i].sortAsc = true
 	}
 
 	return Model{
-		spinner:   s,
-		loading:   true,
+		spinner:     s,
+		loading:     true,
 		filterInput: fi,
-		tabStates: states,
+		tabStates:   states,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, loadFormulae, loadCasks, loadApps)
+	return tea.Batch(m.spinner.Tick, loadFormulae, loadCasks, loadApps, loadServices, loadTaps)
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +190,22 @@ func loadApps() tea.Msg {
 	return appsLoadedMsg(apps)
 }
 
+func loadServices() tea.Msg {
+	svcs, err := data.LoadServices()
+	if err != nil {
+		return servicesLoadedMsg(nil)
+	}
+	return servicesLoadedMsg(svcs)
+}
+
+func loadTaps() tea.Msg {
+	taps, err := data.LoadTaps()
+	if err != nil {
+		return tapsLoadedMsg(nil)
+	}
+	return tapsLoadedMsg(taps)
+}
+
 func loadVulns(formulae, casks []data.Package) tea.Cmd {
 	return func() tea.Msg {
 		enrich := func(pkgs []data.Package) []data.Package {
@@ -193,22 +222,33 @@ func loadVulns(formulae, casks []data.Package) tea.Cmd {
 }
 
 func loadDeps(name string) tea.Cmd {
-	return func() tea.Msg {
-		return depsLoadedMsg(data.LoadDepInfo(name))
-	}
+	return func() tea.Msg { return depsLoadedMsg(data.LoadDepInfo(name)) }
 }
 
 func upgradePackage(name string) tea.Cmd {
 	return func() tea.Msg {
-		err := data.UpgradePackage(name)
-		return upgradeDoneMsg{name: name, err: err}
+		return upgradeDoneMsg{name: name, err: data.UpgradePackage(name)}
 	}
 }
 
 func uninstallPackage(name string, isCask bool) tea.Cmd {
 	return func() tea.Msg {
-		err := data.UninstallPackage(name, isCask)
-		return uninstallDoneMsg{name: name, err: err}
+		return uninstallDoneMsg{name: name, err: data.UninstallPackage(name, isCask)}
+	}
+}
+
+func runServiceAction(action, name string) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		switch action {
+		case "start":
+			err = data.StartService(name)
+		case "stop":
+			err = data.StopService(name)
+		case "restart":
+			err = data.RestartService(name)
+		}
+		return serviceActionDoneMsg{name: name, action: action, err: err}
 	}
 }
 
@@ -247,6 +287,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.apps = []data.App(msg)
 		m.rebuildTables()
 		m.checkDoneLoading(&cmds)
+
+	case servicesLoadedMsg:
+		m.services = []data.Service(msg)
+		m.rebuildTables()
+
+	case tapsLoadedMsg:
+		m.taps = []data.Tap(msg)
+		m.rebuildTables()
 
 	case vulnsLoadedMsg:
 		m.formulae = msg.formulae
@@ -292,6 +340,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks))
 
+	case serviceActionDoneMsg:
+		if msg.err != nil {
+			m.actionMsg = StyleDanger.Render(fmt.Sprintf("✗ %s %s failed: %v", msg.action, msg.name, msg.err))
+		} else {
+			m.actionMsg = StyleOk.Render(fmt.Sprintf("✓ %s %s", msg.action, msg.name))
+		}
+		m.mode = modeNormal
+		cmds = append(cmds, loadServices)
+
 	case errMsg:
 		m.err = msg.err
 		m.loading = false
@@ -300,7 +357,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.handleKey(msg)...)
 	}
 
-	// Forward navigation to active table when in normal mode
+	// Forward navigation keys to the active table in normal mode
 	if m.mode == modeNormal {
 		switch m.activeTab {
 		case tabFormulae:
@@ -311,6 +368,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.aTable, _ = m.aTable.Update(msg)
 		case tabVulns:
 			m.vTable, _ = m.vTable.Update(msg)
+		case tabServices:
+			m.svcTable, _ = m.svcTable.Update(msg)
+		case tabTaps:
+			m.tTable, _ = m.tTable.Update(msg)
 		}
 	}
 
@@ -324,10 +385,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 
 	case modeFilter:
 		switch msg.String() {
-		case "esc":
-			m.mode = modeNormal
-			m.filterInput.Blur()
-		case "enter":
+		case "esc", "enter":
 			m.mode = modeNormal
 			m.filterInput.Blur()
 		default:
@@ -343,8 +401,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 		case "y", "Y":
 			if m.confirmAction == actionUninstall {
 				m.mode = modeUninstalling
-				isCask := m.activeTab == tabCasks
-				cmds = append(cmds, tea.Batch(m.spinner.Tick, uninstallPackage(m.confirmPkg, isCask)))
+				cmds = append(cmds, tea.Batch(m.spinner.Tick, uninstallPackage(m.confirmPkg, m.activeTab == tabCasks)))
 			} else {
 				m.mode = modeUpgrading
 				cmds = append(cmds, tea.Batch(m.spinner.Tick, upgradePackage(m.confirmPkg)))
@@ -366,8 +423,23 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 			cmds = append(cmds, cmd)
 		}
 
-	case modeUpgrading:
-		// block all input while upgrading
+	case modeUpgrading, modeUninstalling, modeServiceRunning:
+		// block input while running
+
+	case modeServiceAction:
+		switch msg.String() {
+		case "s":
+			m.mode = modeServiceRunning
+			cmds = append(cmds, tea.Batch(m.spinner.Tick, runServiceAction("start", m.selectedSvc)))
+		case "o":
+			m.mode = modeServiceRunning
+			cmds = append(cmds, tea.Batch(m.spinner.Tick, runServiceAction("stop", m.selectedSvc)))
+		case "R":
+			m.mode = modeServiceRunning
+			cmds = append(cmds, tea.Batch(m.spinner.Tick, runServiceAction("restart", m.selectedSvc)))
+		case "esc", "q", "enter":
+			m.mode = modeNormal
+		}
 
 	case modeNormal:
 		switch msg.String() {
@@ -381,49 +453,60 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 			m.switchTab(tabApps)
 		case "4":
 			m.switchTab(tabVulns)
+		case "5":
+			m.switchTab(tabServices)
+		case "6":
+			m.switchTab(tabTaps)
 		case "tab":
-			m.switchTab((m.activeTab + 1) % 4)
+			m.switchTab((m.activeTab + 1) % 6)
 		case "r":
 			m.loading = true
 			m.vulnsLoading = false
 			m.actionMsg = ""
 			m.err = nil
-			cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks, loadApps))
+			cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks, loadApps, loadServices, loadTaps))
 		case "/":
 			m.mode = modeFilter
 			m.filterInput.SetValue(m.tabStates[m.activeTab].filter)
 			m.filterInput.Focus()
 			cmds = append(cmds, textinput.Blink)
 		case "esc":
-			// clear filter for current tab
 			m.tabStates[m.activeTab].filter = ""
 			m.filterInput.SetValue("")
 			m.rebuildTables()
 		case "s":
 			st := &m.tabStates[m.activeTab]
-			maxCol := m.maxSortCol()
-			if st.sortCol == maxCol {
+			max := m.maxSortCol()
+			if st.sortCol >= max {
 				st.sortCol = -1
 			} else {
-				if st.sortCol == -1 {
-					st.sortCol = 0
-					st.sortAsc = true
-				} else {
-					st.sortCol++
-					st.sortAsc = true
-				}
+				st.sortCol++
+				st.sortAsc = true
 			}
 			m.rebuildTables()
 		case "S":
-			st := &m.tabStates[m.activeTab]
-			if st.sortCol >= 0 {
+			if st := &m.tabStates[m.activeTab]; st.sortCol >= 0 {
 				st.sortAsc = !st.sortAsc
 				m.rebuildTables()
 			}
 		case "enter":
-			m.detailContent = m.buildDetail()
-			if m.detailContent != "" {
-				m.mode = modeDetail
+			if m.activeTab == tabServices {
+				if name := m.selectedName(); name != "" {
+					m.selectedSvc = name
+					m.mode = modeServiceAction
+				}
+			} else if m.activeTab == tabTaps {
+				if name := m.selectedName(); name != "" {
+					m.detailContent = m.buildTapDetail(name)
+					if m.detailContent != "" {
+						m.mode = modeDetail
+					}
+				}
+			} else {
+				m.detailContent = m.buildDetail()
+				if m.detailContent != "" {
+					m.mode = modeDetail
+				}
 			}
 		case "u":
 			if m.activeTab == tabFormulae || m.activeTab == tabCasks {
@@ -453,11 +536,15 @@ func (m *Model) switchTab(t tab) {
 func (m *Model) maxSortCol() int {
 	switch m.activeTab {
 	case tabFormulae, tabCasks:
-		return 4 // Name, Version, Latest, Size, Status
+		return 5 // Name, Version, Latest, Size, Status, Description
 	case tabApps:
 		return 3 // Name, Version, Build, Size
 	case tabVulns:
 		return 4 // Package, Version, CVE ID, Severity, Summary
+	case tabServices:
+		return 2 // Name, Status, User
+	case tabTaps:
+		return 3 // Name, Formulae, Casks, Remote
 	}
 	return 0
 }
@@ -519,6 +606,8 @@ func (m *Model) selectedName() string {
 		row = m.aTable.SelectedRow()
 	case tabVulns:
 		row = m.vTable.SelectedRow()
+	case tabServices:
+		row = m.svcTable.SelectedRow()
 	}
 	if row == nil {
 		return ""
@@ -540,7 +629,7 @@ func (m *Model) checkDoneLoading(cmds *[]tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 func (m *Model) tableHeight() int {
-	h := m.height - 8 // header(1) + divider(1) + filter(1) + divider(1) + stats(1) + keys(1) + padding(2)
+	h := m.height - 8
 	if h < 5 {
 		h = 5
 	}
@@ -553,15 +642,13 @@ func (m *Model) rebuildTables() {
 	if cw < 60 {
 		cw = 60
 	}
-	fState := m.tabStates[tabFormulae]
-	cState := m.tabStates[tabCasks]
-	aState := m.tabStates[tabApps]
-	vState := m.tabStates[tabVulns]
 
-	m.fTable = buildPackageTable(filteredPkgs(m.formulae, fState.filter), cw, th, fState.sortCol, fState.sortAsc)
-	m.cTable = buildPackageTable(filteredPkgs(m.casks, cState.filter), cw, th, cState.sortCol, cState.sortAsc)
-	m.aTable = buildAppTable(filteredApps(m.apps, aState.filter), cw, th, aState.sortCol, aState.sortAsc)
-	m.vTable = buildVulnTable(filteredPkgs(m.formulae, vState.filter), filteredPkgs(m.casks, vState.filter), cw, th, vState.sortCol, vState.sortAsc)
+	m.fTable = buildPackageTable(filteredPkgs(m.formulae, m.tabStates[tabFormulae].filter), cw, th, m.tabStates[tabFormulae].sortCol, m.tabStates[tabFormulae].sortAsc)
+	m.cTable = buildPackageTable(filteredPkgs(m.casks, m.tabStates[tabCasks].filter), cw, th, m.tabStates[tabCasks].sortCol, m.tabStates[tabCasks].sortAsc)
+	m.aTable = buildAppTable(filteredApps(m.apps, m.tabStates[tabApps].filter), cw, th, m.tabStates[tabApps].sortCol, m.tabStates[tabApps].sortAsc)
+	m.vTable = buildVulnTable(filteredPkgs(m.formulae, m.tabStates[tabVulns].filter), filteredPkgs(m.casks, m.tabStates[tabVulns].filter), cw, th, m.tabStates[tabVulns].sortCol, m.tabStates[tabVulns].sortAsc)
+	m.svcTable = buildServiceTable(filteredServices(m.services, m.tabStates[tabServices].filter), cw, th, m.tabStates[tabServices].sortCol, m.tabStates[tabServices].sortAsc)
+	m.tTable = buildTapTable(filteredTaps(m.taps, m.tabStates[tabTaps].filter), cw, th, m.tabStates[tabTaps].sortCol, m.tabStates[tabTaps].sortAsc)
 
 	if m.depsContent != "" {
 		m.depsViewport.Width = cw
@@ -583,7 +670,7 @@ func filteredPkgs(pkgs []data.Package, query string) []data.Package {
 	for _, p := range pkgs {
 		if strings.Contains(strings.ToLower(p.Name), q) ||
 			strings.Contains(strings.ToLower(p.Version), q) ||
-			strings.Contains(strings.ToLower(p.Latest), q) {
+			strings.Contains(strings.ToLower(p.Description), q) {
 			out = append(out, p)
 		}
 	}
@@ -600,6 +687,21 @@ func filteredApps(apps []data.App, query string) []data.App {
 		if strings.Contains(strings.ToLower(a.Name), q) ||
 			strings.Contains(strings.ToLower(a.Version), q) {
 			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func filteredServices(svcs []data.Service, query string) []data.Service {
+	if query == "" {
+		return svcs
+	}
+	q := strings.ToLower(query)
+	var out []data.Service
+	for _, s := range svcs {
+		if strings.Contains(strings.ToLower(s.Name), q) ||
+			strings.Contains(strings.ToLower(s.Status), q) {
+			out = append(out, s)
 		}
 	}
 	return out
@@ -627,8 +729,9 @@ func sortedPkgs(pkgs []data.Package, col int, asc bool) []data.Package {
 		case 3:
 			less = cp[i].SizeBytes < cp[j].SizeBytes
 		case 4:
-			// status priority: vulnerable > outdated > ok
 			less = pkgStatusPriority(cp[i]) < pkgStatusPriority(cp[j])
+		case 5:
+			less = cp[i].Description < cp[j].Description
 		}
 		if !asc {
 			return !less
@@ -674,6 +777,43 @@ func sortedApps(apps []data.App, col int, asc bool) []data.App {
 	return cp
 }
 
+func sortedServices(svcs []data.Service, col int, asc bool) []data.Service {
+	if col < 0 {
+		return svcs
+	}
+	cp := make([]data.Service, len(svcs))
+	copy(cp, svcs)
+	sort.SliceStable(cp, func(i, j int) bool {
+		var less bool
+		switch col {
+		case 0:
+			less = cp[i].Name < cp[j].Name
+		case 1:
+			less = svcStatusPriority(cp[i].Status) < svcStatusPriority(cp[j].Status)
+		case 2:
+			less = cp[i].User < cp[j].User
+		}
+		if !asc {
+			return !less
+		}
+		return less
+	})
+	return cp
+}
+
+func svcStatusPriority(s string) int {
+	switch s {
+	case "error":
+		return 0
+	case "started":
+		return 1
+	case "stopped":
+		return 2
+	default:
+		return 3
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Table builders
 // ---------------------------------------------------------------------------
@@ -691,13 +831,14 @@ func sortIndicator(col, activeCol int, asc bool) string {
 func buildPackageTable(pkgs []data.Package, width, height, sortCol int, sortAsc bool) table.Model {
 	pkgs = sortedPkgs(pkgs, sortCol, sortAsc)
 
-	nameW := width / 4
-	verW := 12
-	latestW := 12
-	sizeW := 10
-	statusW := width - nameW - verW - latestW - sizeW - 6
-	if statusW < 10 {
-		statusW = 10
+	nameW := width / 5
+	verW := 10
+	latestW := 10
+	sizeW := 8
+	statusW := 12
+	descW := width - nameW - verW - latestW - sizeW - statusW - 8
+	if descW < 10 {
+		descW = 10
 	}
 
 	cols := []table.Column{
@@ -706,6 +847,7 @@ func buildPackageTable(pkgs []data.Package, width, height, sortCol int, sortAsc 
 		{Title: "Latest" + sortIndicator(2, sortCol, sortAsc), Width: latestW},
 		{Title: "Size" + sortIndicator(3, sortCol, sortAsc), Width: sizeW},
 		{Title: "Status" + sortIndicator(4, sortCol, sortAsc), Width: statusW},
+		{Title: "Description" + sortIndicator(5, sortCol, sortAsc), Width: descW},
 	}
 
 	rows := make([]table.Row, 0, len(pkgs))
@@ -719,7 +861,8 @@ func buildPackageTable(pkgs []data.Package, width, height, sortCol int, sortAsc 
 			p.Version,
 			p.Latest,
 			data.FormatSize(p.SizeBytes),
-			StatusIcon(p.Outdated, p.Vulnerable, sev),
+			StatusText(p.Outdated, p.Vulnerable, sev),
+			truncateStr(p.Description, descW),
 		})
 	}
 	return styledTable(cols, rows, height)
@@ -748,6 +891,112 @@ func buildAppTable(apps []data.App, width, height, sortCol int, sortAsc bool) ta
 		rows = append(rows, table.Row{a.Name, a.Version, a.Build, data.FormatSize(a.Size)})
 	}
 	return styledTable(cols, rows, height)
+}
+
+func buildServiceTable(svcs []data.Service, width, height, sortCol int, sortAsc bool) table.Model {
+	svcs = sortedServices(svcs, sortCol, sortAsc)
+
+	nameW := width / 3
+	statusW := 12
+	userW := 20
+	fileW := width - nameW - statusW - userW - 6
+	if fileW < 10 {
+		fileW = 10
+	}
+
+	cols := []table.Column{
+		{Title: "Name" + sortIndicator(0, sortCol, sortAsc), Width: nameW},
+		{Title: "Status" + sortIndicator(1, sortCol, sortAsc), Width: statusW},
+		{Title: "User" + sortIndicator(2, sortCol, sortAsc), Width: userW},
+		{Title: "Plist File", Width: fileW},
+	}
+
+	rows := make([]table.Row, 0, len(svcs))
+	for _, s := range svcs {
+		rows = append(rows, table.Row{
+			s.Name,
+			svcStatusIcon(s.Status),
+			s.User,
+			truncateStr(s.File, fileW),
+		})
+	}
+	return styledTable(cols, rows, height)
+}
+
+func filteredTaps(taps []data.Tap, query string) []data.Tap {
+	if query == "" {
+		return taps
+	}
+	q := strings.ToLower(query)
+	var out []data.Tap
+	for _, t := range taps {
+		if strings.Contains(strings.ToLower(t.Name), q) ||
+			strings.Contains(strings.ToLower(t.Remote), q) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func buildTapTable(taps []data.Tap, width, height, sortCol int, sortAsc bool) table.Model {
+	cp := make([]data.Tap, len(taps))
+	copy(cp, taps)
+	sort.SliceStable(cp, func(i, j int) bool {
+		var less bool
+		switch sortCol {
+		case 1:
+			less = cp[i].Formulae < cp[j].Formulae
+		case 2:
+			less = cp[i].Casks < cp[j].Casks
+		case 3:
+			less = cp[i].Remote < cp[j].Remote
+		default:
+			less = cp[i].Name < cp[j].Name
+		}
+		if !sortAsc {
+			return !less
+		}
+		return less
+	})
+
+	nameW := width / 3
+	formulaeW := 10
+	casksW := 8
+	remoteW := width - nameW - formulaeW - casksW - 8
+	if remoteW < 15 {
+		remoteW = 15
+	}
+
+	cols := []table.Column{
+		{Title: "Tap" + sortIndicator(0, sortCol, sortAsc), Width: nameW},
+		{Title: "Formulae" + sortIndicator(1, sortCol, sortAsc), Width: formulaeW},
+		{Title: "Casks" + sortIndicator(2, sortCol, sortAsc), Width: casksW},
+		{Title: "Remote" + sortIndicator(3, sortCol, sortAsc), Width: remoteW},
+	}
+
+	rows := make([]table.Row, 0, len(cp))
+	for _, t := range cp {
+		rows = append(rows, table.Row{
+			t.Name,
+			fmt.Sprintf("%d", t.Formulae),
+			fmt.Sprintf("%d", t.Casks),
+			truncateStr(t.Remote, remoteW),
+		})
+	}
+	return styledTable(cols, rows, height)
+}
+
+func svcStatusIcon(status string) string {
+	switch status {
+	case "started":
+		return StyleOk.Render("● started")
+	case "stopped":
+		return StyleWarn.Render("○ stopped")
+	case "error":
+		return StyleDanger.Render("✗ error")
+	default:
+		return StyleMuted.Render("— none")
+	}
 }
 
 type vulnRow struct {
@@ -846,6 +1095,16 @@ func styledTable(cols []table.Column, rows []table.Row, height int) table.Model 
 	return t
 }
 
+func truncateStr(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
 // ---------------------------------------------------------------------------
 // Detail builders
 // ---------------------------------------------------------------------------
@@ -888,21 +1147,59 @@ func (m Model) buildDetail() string {
 
 func packageDetail(p data.Package) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Name:    %s\n", p.Name))
-	sb.WriteString(fmt.Sprintf("Version: %s\n", p.Version))
-	sb.WriteString(fmt.Sprintf("Latest:  %s\n", p.Latest))
-	sb.WriteString(fmt.Sprintf("Size:    %s\n", data.FormatSize(p.SizeBytes)))
+	sb.WriteString(fmt.Sprintf("%-10s %s\n", "Name:", p.Name))
+	if p.Description != "" {
+		sb.WriteString(fmt.Sprintf("%-10s %s\n", "About:", p.Description))
+	}
+	if p.Homepage != "" {
+		sb.WriteString(fmt.Sprintf("%-10s %s\n", "Homepage:", p.Homepage))
+	}
+	if p.License != "" {
+		sb.WriteString(fmt.Sprintf("%-10s %s\n", "License:", p.License))
+	}
+	sb.WriteString(fmt.Sprintf("%-10s %s\n", "Version:", p.Version))
+	sb.WriteString(fmt.Sprintf("%-10s %s\n", "Latest:", p.Latest))
+	sb.WriteString(fmt.Sprintf("%-10s %s\n", "Size:", data.FormatSize(p.SizeBytes)))
 	if p.Outdated {
-		sb.WriteString(StyleWarn.Render("\n⚠  Update available\n"))
+		sb.WriteString(StyleWarn.Render("\n⚠  Update available: " + p.Latest + "\n"))
+	}
+	if p.Caveats != "" {
+		sb.WriteString(StyleWarn.Render("\nCaveats:\n"))
+		sb.WriteString(StyleMuted.Render(p.Caveats + "\n"))
 	}
 	if len(p.CVEs) > 0 {
-		sb.WriteString("\nVulnerabilities:\n")
+		sb.WriteString(StyleDanger.Render("\nVulnerabilities:\n"))
 		for _, c := range p.CVEs {
 			sb.WriteString(fmt.Sprintf("  %s [%s]  %s\n", c.ID, c.Severity, c.Summary))
 			sb.WriteString(StyleMuted.Render(fmt.Sprintf("  %s\n\n", c.URL)))
 		}
 	}
 	return sb.String()
+}
+
+func (m Model) buildTapDetail(name string) string {
+	for _, t := range m.taps {
+		if t.Name == name {
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("%-12s %s\n", "Tap:", t.Name))
+			sb.WriteString(fmt.Sprintf("%-12s %d\n", "Formulae:", t.Formulae))
+			sb.WriteString(fmt.Sprintf("%-12s %d\n", "Casks:", t.Casks))
+			if t.Remote != "" {
+				sb.WriteString(fmt.Sprintf("%-12s %s\n", "Remote:", t.Remote))
+			}
+			if t.Branch != "" {
+				sb.WriteString(fmt.Sprintf("%-12s %s\n", "Branch:", t.Branch))
+			}
+			if t.LastCommit != "" {
+				sb.WriteString(fmt.Sprintf("%-12s %s\n", "Last commit:", t.LastCommit))
+			}
+			if t.Official {
+				sb.WriteString(StyleOk.Render("\n● Official Homebrew tap\n"))
+			}
+			return sb.String()
+		}
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -914,8 +1211,7 @@ func (m Model) View() string {
 		return "Initializing…"
 	}
 
-	// ── Header ──────────────────────────────────────────────────────────────
-	title := StyleTitle.Render("brew-monitor")
+	title := StyleTitle.Render("cellar")
 	tabs := ""
 	for i, name := range tabNames {
 		if tab(i) == m.activeTab {
@@ -927,30 +1223,20 @@ func (m Model) View() string {
 	header := lipgloss.JoinHorizontal(lipgloss.Left, title, "  ", tabs)
 	divider := StyleMuted.Render(strings.Repeat("─", m.width))
 
-	// ── Filter bar ──────────────────────────────────────────────────────────
-	filterBar := m.renderFilterBar()
-
-	// ── Body ────────────────────────────────────────────────────────────────
-	body := m.renderBody()
-
-	// ── Status bar ──────────────────────────────────────────────────────────
-	statusBar := m.renderStatusBar()
-
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
 		divider,
-		filterBar,
-		body,
+		m.renderFilterBar(),
+		m.renderBody(),
 		divider,
-		statusBar,
+		m.renderStatusBar(),
 	)
 }
 
 func (m Model) renderFilterBar() string {
 	st := m.tabStates[m.activeTab]
 	if m.mode == modeFilter {
-		prompt := StyleWarn.Render("/") + " " + m.filterInput.View()
-		return "  " + prompt
+		return "  " + StyleWarn.Render("/") + " " + m.filterInput.View()
 	}
 	if st.filter != "" {
 		return "  " + StyleMuted.Render("filter: ") + StyleWarn.Render(st.filter) + StyleMuted.Render("  [esc to clear]")
@@ -961,39 +1247,44 @@ func (m Model) renderFilterBar() string {
 func (m Model) renderBody() string {
 	switch m.mode {
 	case modeDetail:
-		return StyleDetail.Width(m.width - 4).Render(m.detailContent) +
+		return StyleDetail.Width(m.width-4).Render(m.detailContent) +
 			StyleMuted.Render("\n  any key to close")
 
 	case modeConfirm:
 		var msg string
 		if m.confirmAction == actionUninstall {
-			msg = fmt.Sprintf(
-				"Uninstall %s  (%s)\n\n  [y] confirm   [n/esc] cancel",
-				StyleDanger.Render(m.confirmPkg),
-				StyleMuted.Render(m.confirmFrom),
-			)
+			msg = fmt.Sprintf("Uninstall %s  (%s)\n\n  [y] confirm   [n/esc] cancel",
+				StyleDanger.Render(m.confirmPkg), StyleMuted.Render(m.confirmFrom))
 		} else {
-			msg = fmt.Sprintf(
-				"Upgrade %s\n  %s  →  %s\n\n  [y] confirm   [n/esc] cancel",
-				StyleTabActive.Render(m.confirmPkg),
-				StyleMuted.Render(m.confirmFrom),
-				StyleOk.Render(m.confirmTo),
-			)
+			msg = fmt.Sprintf("Upgrade %s\n  %s  →  %s\n\n  [y] confirm   [n/esc] cancel",
+				StyleTabActive.Render(m.confirmPkg), StyleMuted.Render(m.confirmFrom), StyleOk.Render(m.confirmTo))
 		}
 		return StyleDetail.Width(m.width - 4).Render(msg)
 
 	case modeDeps:
-		header := StyleTabActive.Render("Dependency tree") + StyleMuted.Render("  [esc/d] close  [↑↓] scroll")
-		return lipgloss.JoinVertical(lipgloss.Left, "  "+header, m.depsViewport.View())
+		hdr := StyleTabActive.Render("Dependency tree") + StyleMuted.Render("  [esc/d] close  [↑↓] scroll")
+		return lipgloss.JoinVertical(lipgloss.Left, "  "+hdr, m.depsViewport.View())
 
 	case modeUpgrading:
 		return fmt.Sprintf("\n  %s Upgrading %s…\n", m.spinner.View(), StyleTabActive.Render(m.confirmPkg))
 
 	case modeUninstalling:
 		return fmt.Sprintf("\n  %s Uninstalling %s…\n", m.spinner.View(), StyleDanger.Render(m.confirmPkg))
+
+	case modeServiceAction:
+		svc := m.findService(m.selectedSvc)
+		statusLine := ""
+		if svc != nil {
+			statusLine = fmt.Sprintf("Status:  %s\n\n", svcStatusIcon(svc.Status))
+		}
+		msg := fmt.Sprintf("Service: %s\n%s  [s] start   [o] stop   [R] restart   [esc] cancel",
+			StyleTabActive.Render(m.selectedSvc), statusLine)
+		return StyleDetail.Width(m.width - 4).Render(msg)
+
+	case modeServiceRunning:
+		return fmt.Sprintf("\n  %s Running service command…\n", m.spinner.View())
 	}
 
-	// Normal / loading
 	if m.loading {
 		return fmt.Sprintf("\n  %s Loading data…\n", m.spinner.View())
 	}
@@ -1016,8 +1307,27 @@ func (m Model) renderBody() string {
 			return StyleMuted.Render("\n  No vulnerabilities found.")
 		}
 		return m.vTable.View()
+	case tabServices:
+		if len(m.services) == 0 {
+			return StyleMuted.Render("\n  No services found.")
+		}
+		return m.svcTable.View()
+	case tabTaps:
+		if len(m.taps) == 0 {
+			return StyleMuted.Render("\n  No taps found.")
+		}
+		return m.tTable.View()
 	}
 	return ""
+}
+
+func (m Model) findService(name string) *data.Service {
+	for i := range m.services {
+		if m.services[i].Name == name {
+			return &m.services[i]
+		}
+	}
+	return nil
 }
 
 func (m Model) renderStatusBar() string {
@@ -1033,12 +1343,24 @@ func (m Model) renderStatusBar() string {
 			outdatedCount++
 		}
 	}
+	startedCount := 0
+	for _, s := range m.services {
+		if s.Status == "started" {
+			startedCount++
+		}
+	}
 
 	parts := []string{
 		fmt.Sprintf("scan: %s", scanTime),
 		fmt.Sprintf("%d formulae", len(m.formulae)),
 		fmt.Sprintf("%d casks", len(m.casks)),
 		fmt.Sprintf("%d apps", len(m.apps)),
+	}
+	if len(m.services) > 0 {
+		parts = append(parts, fmt.Sprintf("%d/%d services", startedCount, len(m.services)))
+	}
+	if len(m.taps) > 0 {
+		parts = append(parts, fmt.Sprintf("%d taps", len(m.taps)))
 	}
 	if outdatedCount > 0 {
 		parts = append(parts, StyleWarn.Render(fmt.Sprintf("%d outdated", outdatedCount)))
@@ -1058,6 +1380,8 @@ func (m Model) renderStatusBar() string {
 		keys = StyleMuted.Render("[y] yes  [n/esc] no")
 	case modeDeps:
 		keys = StyleMuted.Render("[↑↓] scroll  [esc/d] close")
+	case modeServiceAction:
+		keys = StyleMuted.Render("[s] start  [o] stop  [R] restart  [esc] cancel")
 	default:
 		sortInfo := ""
 		if st := m.tabStates[m.activeTab]; st.sortCol >= 0 {
@@ -1067,7 +1391,14 @@ func (m Model) renderStatusBar() string {
 			}
 			sortInfo = fmt.Sprintf(" sort:col%d%s", st.sortCol, dir)
 		}
-		keys = StyleMuted.Render("[/] filter  [s/S] sort"+sortInfo+"  [u] upgrade  [x] uninstall  [d] deps  [r] refresh  [q] quit")
+		switch m.activeTab {
+		case tabServices:
+			keys = StyleMuted.Render("[enter] manage  [/] filter  [s/S] sort" + sortInfo + "  [r] refresh  [q] quit")
+		case tabTaps:
+			keys = StyleMuted.Render("[enter] detail  [/] filter  [s/S] sort" + sortInfo + "  [r] refresh  [q] quit")
+		default:
+			keys = StyleMuted.Render("[enter] detail  [/] filter  [s/S] sort" + sortInfo + "  [u] upgrade  [x] uninstall  [d] deps  [r] refresh  [q] quit")
+		}
 	}
 
 	stats := StyleStatusBar.Render(strings.Join(parts, "  ·  "))

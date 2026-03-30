@@ -8,24 +8,34 @@ import (
 )
 
 type Package struct {
-	Name       string
-	Version    string
-	Latest     string
-	SizeBytes  int64
-	Outdated   bool
-	Vulnerable bool
-	CVEs       []CVE
+	Name        string
+	Version     string
+	Latest      string
+	SizeBytes   int64
+	Outdated    bool
+	Vulnerable  bool
+	CVEs        []CVE
+	Description string
+	Homepage    string
+	License     string
+	Caveats     string
 }
 
 type brewInfoJSON struct {
 	Formulae []struct {
-		Name      string `json:"name"`
+		Name     string `json:"name"`
+		Desc     string `json:"desc"`
+		Homepage string `json:"homepage"`
+		License  string `json:"license"`
+		Caveats  string `json:"caveats"`
 		Installed []struct {
 			Version string `json:"version"`
 		} `json:"installed"`
 	} `json:"formulae"`
 	Casks []struct {
 		Token     string `json:"token"`
+		Desc      string `json:"desc"`
+		Homepage  string `json:"homepage"`
 		Version   string `json:"version"`
 		Installed string `json:"installed"`
 	} `json:"casks"`
@@ -33,12 +43,12 @@ type brewInfoJSON struct {
 
 type brewOutdatedJSON struct {
 	Formulae []struct {
-		Name          string `json:"name"`
+		Name              string   `json:"name"`
 		InstalledVersions []string `json:"installed_versions"`
 		CurrentVersion    string   `json:"current_version"`
 	} `json:"formulae"`
 	Casks []struct {
-		Name           string `json:"name"`
+		Name              string   `json:"name"`
 		InstalledVersions []string `json:"installed_versions"`
 		CurrentVersion    string   `json:"current_version"`
 	} `json:"casks"`
@@ -74,18 +84,20 @@ func LoadBrewFormulae() ([]Package, error) {
 			continue
 		}
 		ver := f.Installed[0].Version
-		size := cellarDiskSize(f.Name)
-
 		latest, isOutdated := outdatedMap[f.Name]
 		if !isOutdated {
 			latest = ver
 		}
 		pkgs = append(pkgs, Package{
-			Name:     f.Name,
-			Version:  ver,
-			Latest:   latest,
-			SizeBytes: size,
-			Outdated: isOutdated,
+			Name:        f.Name,
+			Version:     ver,
+			Latest:      latest,
+			SizeBytes:   cellarDiskSize(f.Name),
+			Outdated:    isOutdated,
+			Description: f.Desc,
+			Homepage:    f.Homepage,
+			License:     f.License,
+			Caveats:     strings.TrimSpace(f.Caveats),
 		})
 	}
 	return pkgs, nil
@@ -125,16 +137,14 @@ func LoadBrewCasks() ([]Package, error) {
 		if !isOutdated {
 			latest = ver
 		}
-
-		// get disk size via du
-		size := caskDiskSize(c.Token)
-
 		pkgs = append(pkgs, Package{
-			Name:     c.Token,
-			Version:  ver,
-			Latest:   latest,
-			SizeBytes: size,
-			Outdated: isOutdated,
+			Name:        c.Token,
+			Version:     ver,
+			Latest:      latest,
+			SizeBytes:   caskDiskSize(c.Token),
+			Outdated:    isOutdated,
+			Description: c.Desc,
+			Homepage:    c.Homepage,
 		})
 	}
 	return pkgs, nil

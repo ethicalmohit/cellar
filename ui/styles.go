@@ -48,6 +48,7 @@ var (
 			Padding(0, 1)
 )
 
+// StatusIcon returns a colored status string for use in detail panels.
 func StatusIcon(outdated, vulnerable bool, severity string) string {
 	if vulnerable {
 		switch severity {
@@ -61,4 +62,17 @@ func StatusIcon(outdated, vulnerable bool, severity string) string {
 		return StyleWarn.Render("↑ outdated")
 	}
 	return StyleOk.Render("✓ ok")
+}
+
+// StatusText returns a plain-text status string safe for table cells.
+// Bubbles table uses runewidth.Truncate internally, which does not strip ANSI
+// escape codes — passing colored strings corrupts the cell layout.
+func StatusText(outdated, vulnerable bool, severity string) string {
+	if vulnerable {
+		return "● CVE"
+	}
+	if outdated {
+		return "↑ outdated"
+	}
+	return "✓ ok"
 }
