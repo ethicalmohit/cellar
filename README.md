@@ -41,7 +41,7 @@ A terminal UI for monitoring your Homebrew packages and macOS applications — w
 ### Build from source
 
 ```bash
-git clone https://github.com/mohit/cellar
+git clone https://github.com/ethicalmohit/cellar
 cd cellar
 make install
 ```
@@ -51,13 +51,13 @@ This builds the binary and copies it to `/usr/local/bin/cellar`.
 ### Go install
 
 ```bash
-go install github.com/mohit/cellar@latest
+go install github.com/ethicalmohit/cellar@latest
 ```
 
 ### Manual build
 
 ```bash
-git clone https://github.com/mohit/cellar
+git clone https://github.com/ethicalmohit/cellar
 cd cellar
 go build -o cellar .
 ./cellar
