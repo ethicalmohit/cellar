@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mohit/cellar/data"
+	"github.com/ethicalmohit/cellar/data"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
