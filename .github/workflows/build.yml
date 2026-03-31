@@ -23,29 +23,3 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: macos-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Build release binary (arm64)
-        run: GOARCH=arm64 go build -ldflags "-X main.version=${{ github.ref_name }}" -o cellar-macos-arm64 .
-
-      - name: Build release binary (amd64)
-        run: GOARCH=amd64 go build -ldflags "-X main.version=${{ github.ref_name }}" -o cellar-macos-amd64 .
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            cellar-macos-arm64
-            cellar-macos-amd64
