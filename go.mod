@@ -1,4 +1,4 @@
-module github.com/mohit/cellar
+module github.com/ethicalmohit/cellar
 
 go 1.25.2
 
