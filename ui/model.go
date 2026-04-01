@@ -357,21 +357,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.handleKey(msg)...)
 	}
 
-	// Forward navigation keys to the active table in normal mode
+	// Forward navigation keys to the active table in normal mode.
+	// Keys consumed by handleKey must NOT be forwarded — some conflict with
+	// Bubbles table's built-in bindings ("d"=HalfPageDown, "u"=HalfPageUp)
+	// which would scroll the cursor to an unintended row.
 	if m.mode == modeNormal {
-		switch m.activeTab {
-		case tabFormulae:
-			m.fTable, _ = m.fTable.Update(msg)
-		case tabCasks:
-			m.cTable, _ = m.cTable.Update(msg)
-		case tabApps:
-			m.aTable, _ = m.aTable.Update(msg)
-		case tabVulns:
-			m.vTable, _ = m.vTable.Update(msg)
-		case tabServices:
-			m.svcTable, _ = m.svcTable.Update(msg)
-		case tabTaps:
-			m.tTable, _ = m.tTable.Update(msg)
+		if km, ok := msg.(tea.KeyMsg); ok {
+			switch km.String() {
+			case "q", "ctrl+c",
+				"1", "2", "3", "4", "5", "6",
+				"tab",
+				"r", "/", "esc", "s", "S",
+				"enter", "u", "x", "d":
+				// consumed by handleKey — do not forward to table
+			default:
+				switch m.activeTab {
+				case tabFormulae:
+					m.fTable, _ = m.fTable.Update(msg)
+				case tabCasks:
+					m.cTable, _ = m.cTable.Update(msg)
+				case tabApps:
+					m.aTable, _ = m.aTable.Update(msg)
+				case tabVulns:
+					m.vTable, _ = m.vTable.Update(msg)
+				case tabServices:
+					m.svcTable, _ = m.svcTable.Update(msg)
+				case tabTaps:
+					m.tTable, _ = m.tTable.Update(msg)
+				}
+			}
 		}
 	}
 
