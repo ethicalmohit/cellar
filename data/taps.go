@@ -47,3 +47,21 @@ func LoadTaps() ([]Tap, error) {
 	}
 	return taps, nil
 }
+
+func AddTap(name string) error {
+	cmd := exec.Command("brew", "tap", name)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(out))
+	}
+	return nil
+}
+
+func RemoveTap(name string) error {
+	cmd := exec.Command("brew", "untap", name)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, string(out))
+	}
+	return nil
+}

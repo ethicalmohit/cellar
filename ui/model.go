@@ -45,6 +45,10 @@ const (
 	modeUninstalling
 	modeServiceAction
 	modeServiceRunning
+	modeTapInput
+	modeTapRunning
+	modeInstallInput
+	modeInstalling
 )
 
 type confirmAction int
@@ -52,6 +56,7 @@ type confirmAction int
 const (
 	actionUpgrade confirmAction = iota
 	actionUninstall
+	actionUntap
 )
 
 type tabState struct {
@@ -79,6 +84,16 @@ type uninstallDoneMsg struct{ name string; err error }
 type serviceActionDoneMsg struct {
 	name   string
 	action string
+	err    error
+}
+type tapDoneMsg struct {
+	name   string
+	action string
+	err    error
+}
+type installDoneMsg struct {
+	name   string
+	isCask bool
 	err    error
 }
 type errMsg struct{ err error }
@@ -125,6 +140,10 @@ type Model struct {
 	selectedSvc string
 	actionMsg   string
 
+	// tap add/remove
+	tapInput  textinput.Model
+	tapAction string // "add" or "remove"
+
 	// deps panel
 	depsViewport viewport.Model
 	depsContent  string
@@ -144,6 +163,10 @@ func New() Model {
 	fi.Placeholder = "type to filter…"
 	fi.CharLimit = 64
 
+	ti := textinput.New()
+	ti.Placeholder = "e.g. homebrew/cask-fonts"
+	ti.CharLimit = 100
+
 	states := [6]tabState{}
 	for i := range states {
 		states[i].sortCol = -1
@@ -154,6 +177,7 @@ func New() Model {
 		spinner:     s,
 		loading:     true,
 		filterInput: fi,
+		tapInput:    ti,
 		tabStates:   states,
 	}
 }
@@ -234,6 +258,24 @@ func upgradePackage(name string) tea.Cmd {
 func uninstallPackage(name string, isCask bool) tea.Cmd {
 	return func() tea.Msg {
 		return uninstallDoneMsg{name: name, err: data.UninstallPackage(name, isCask)}
+	}
+}
+
+func addTap(name string) tea.Cmd {
+	return func() tea.Msg {
+		return tapDoneMsg{name: name, action: "add", err: data.AddTap(name)}
+	}
+}
+
+func removeTap(name string) tea.Cmd {
+	return func() tea.Msg {
+		return tapDoneMsg{name: name, action: "remove", err: data.RemoveTap(name)}
+	}
+}
+
+func installPackage(name string, isCask bool) tea.Cmd {
+	return func() tea.Msg {
+		return installDoneMsg{name: name, isCask: isCask, err: data.InstallPackage(name, isCask)}
 	}
 }
 
@@ -349,6 +391,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		cmds = append(cmds, loadServices)
 
+	case tapDoneMsg:
+		if msg.err != nil {
+			m.actionMsg = StyleDanger.Render(fmt.Sprintf("✗ %s tap failed: %v", msg.action, msg.err))
+		} else {
+			m.actionMsg = StyleOk.Render(fmt.Sprintf("✓ %s %s", msg.action, msg.name))
+		}
+		m.mode = modeNormal
+		cmds = append(cmds, loadTaps)
+
+	case installDoneMsg:
+		if msg.err != nil {
+			m.actionMsg = StyleDanger.Render("✗ install failed: " + msg.err.Error())
+		} else {
+			m.actionMsg = StyleOk.Render("✓ installed " + msg.name)
+		}
+		m.mode = modeNormal
+		m.loading = true
+		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks))
+
 	case errMsg:
 		m.err = msg.err
 		m.loading = false
@@ -368,7 +429,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				"1", "2", "3", "4", "5", "6",
 				"tab",
 				"r", "/", "esc", "s", "S",
-				"enter", "u", "x", "d":
+				"enter", "u", "x", "d", "a":
 				// consumed by handleKey — do not forward to table
 			default:
 				switch m.activeTab {
@@ -413,12 +474,17 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 	case modeConfirm:
 		switch msg.String() {
 		case "y", "Y":
-			if m.confirmAction == actionUninstall {
+			switch m.confirmAction {
+			case actionUninstall:
 				m.mode = modeUninstalling
 				cmds = append(cmds, tea.Batch(m.spinner.Tick, uninstallPackage(m.confirmPkg, m.activeTab == tabCasks)))
-			} else {
+			case actionUpgrade:
 				m.mode = modeUpgrading
 				cmds = append(cmds, tea.Batch(m.spinner.Tick, upgradePackage(m.confirmPkg)))
+			case actionUntap:
+				m.tapAction = "remove"
+				m.mode = modeTapRunning
+				cmds = append(cmds, tea.Batch(m.spinner.Tick, removeTap(m.confirmPkg)))
 			}
 		case "n", "N", "esc", "q":
 			m.mode = modeNormal
@@ -437,8 +503,43 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 			cmds = append(cmds, cmd)
 		}
 
-	case modeUpgrading, modeUninstalling, modeServiceRunning:
+	case modeUpgrading, modeUninstalling, modeServiceRunning, modeTapRunning, modeInstalling:
 		// block input while running
+
+	case modeTapInput:
+		switch msg.String() {
+		case "esc":
+			m.mode = modeNormal
+			m.tapInput.Blur()
+		case "enter":
+			name := strings.TrimSpace(m.tapInput.Value())
+			if name != "" {
+				m.tapAction = "add"
+				m.mode = modeTapRunning
+				cmds = append(cmds, tea.Batch(m.spinner.Tick, addTap(name)))
+			}
+		default:
+			var cmd tea.Cmd
+			m.tapInput, cmd = m.tapInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+
+	case modeInstallInput:
+		switch msg.String() {
+		case "esc":
+			m.mode = modeNormal
+			m.tapInput.Blur()
+		case "enter":
+			name := strings.TrimSpace(m.tapInput.Value())
+			if name != "" {
+				m.mode = modeInstalling
+				cmds = append(cmds, tea.Batch(m.spinner.Tick, installPackage(name, m.activeTab == tabCasks)))
+			}
+		default:
+			var cmd tea.Cmd
+			m.tapInput, cmd = m.tapInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
 
 	case modeServiceAction:
 		switch msg.String() {
@@ -526,8 +627,34 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 			if m.activeTab == tabFormulae || m.activeTab == tabCasks {
 				m.tryConfirmUpgrade()
 			}
+		case "a":
+			if m.activeTab == tabTaps {
+				m.tapInput.Placeholder = "e.g. homebrew/cask-fonts"
+				m.tapInput.SetValue("")
+				m.tapInput.Focus()
+				m.mode = modeTapInput
+				cmds = append(cmds, textinput.Blink)
+			} else if m.activeTab == tabFormulae {
+				m.tapInput.Placeholder = "e.g. ripgrep"
+				m.tapInput.SetValue("")
+				m.tapInput.Focus()
+				m.mode = modeInstallInput
+				cmds = append(cmds, textinput.Blink)
+			} else if m.activeTab == tabCasks {
+				m.tapInput.Placeholder = "e.g. firefox"
+				m.tapInput.SetValue("")
+				m.tapInput.Focus()
+				m.mode = modeInstallInput
+				cmds = append(cmds, textinput.Blink)
+			}
 		case "x":
-			if m.activeTab == tabFormulae || m.activeTab == tabCasks {
+			if m.activeTab == tabTaps {
+				if name := m.selectedName(); name != "" {
+					m.confirmPkg = name
+					m.confirmAction = actionUntap
+					m.mode = modeConfirm
+				}
+			} else if m.activeTab == tabFormulae || m.activeTab == tabCasks {
 				m.tryConfirmUninstall()
 			}
 		case "d":
@@ -622,6 +749,8 @@ func (m *Model) selectedName() string {
 		row = m.vTable.SelectedRow()
 	case tabServices:
 		row = m.svcTable.SelectedRow()
+	case tabTaps:
+		row = m.tTable.SelectedRow()
 	}
 	if row == nil {
 		return ""
@@ -1266,14 +1395,40 @@ func (m Model) renderBody() string {
 
 	case modeConfirm:
 		var msg string
-		if m.confirmAction == actionUninstall {
+		switch m.confirmAction {
+		case actionUninstall:
 			msg = fmt.Sprintf("Uninstall %s  (%s)\n\n  [y] confirm   [n/esc] cancel",
 				StyleDanger.Render(m.confirmPkg), StyleMuted.Render(m.confirmFrom))
-		} else {
+		case actionUntap:
+			msg = fmt.Sprintf("Remove tap %s?\n\n  [y] confirm   [n/esc] cancel",
+				StyleDanger.Render(m.confirmPkg))
+		default:
 			msg = fmt.Sprintf("Upgrade %s\n  %s  →  %s\n\n  [y] confirm   [n/esc] cancel",
 				StyleTabActive.Render(m.confirmPkg), StyleMuted.Render(m.confirmFrom), StyleOk.Render(m.confirmTo))
 		}
 		return StyleDetail.Width(m.width - 4).Render(msg)
+
+	case modeTapInput:
+		prompt := fmt.Sprintf("Add tap:\n\n  %s\n\n  [enter] confirm   [esc] cancel", m.tapInput.View())
+		return StyleDetail.Width(m.width - 4).Render(prompt)
+
+	case modeTapRunning:
+		verb := "Adding"
+		if m.tapAction == "remove" {
+			verb = "Removing"
+		}
+		return fmt.Sprintf("\n  %s %s tap…\n", m.spinner.View(), verb)
+
+	case modeInstallInput:
+		kind := "formula"
+		if m.activeTab == tabCasks {
+			kind = "cask"
+		}
+		prompt := fmt.Sprintf("Install %s:\n\n  %s\n\n  [enter] confirm   [esc] cancel", kind, m.tapInput.View())
+		return StyleDetail.Width(m.width - 4).Render(prompt)
+
+	case modeInstalling:
+		return fmt.Sprintf("\n  %s Installing…\n", m.spinner.View())
 
 	case modeDeps:
 		hdr := StyleTabActive.Render("Dependency tree") + StyleMuted.Render("  [esc/d] close  [↑↓] scroll")
@@ -1396,6 +1551,8 @@ func (m Model) renderStatusBar() string {
 		keys = StyleMuted.Render("[↑↓] scroll  [esc/d] close")
 	case modeServiceAction:
 		keys = StyleMuted.Render("[s] start  [o] stop  [R] restart  [esc] cancel")
+	case modeTapInput, modeInstallInput:
+		keys = StyleMuted.Render("[enter] confirm  [esc] cancel")
 	default:
 		sortInfo := ""
 		if st := m.tabStates[m.activeTab]; st.sortCol >= 0 {
@@ -1409,9 +1566,11 @@ func (m Model) renderStatusBar() string {
 		case tabServices:
 			keys = StyleMuted.Render("[enter] manage  [/] filter  [s/S] sort" + sortInfo + "  [r] refresh  [q] quit")
 		case tabTaps:
-			keys = StyleMuted.Render("[enter] detail  [/] filter  [s/S] sort" + sortInfo + "  [r] refresh  [q] quit")
+			keys = StyleMuted.Render("[a] add tap  [x] remove  [enter] detail  [/] filter  [s/S] sort" + sortInfo + "  [r] refresh  [q] quit")
+		case tabFormulae, tabCasks:
+			keys = StyleMuted.Render("[a] install  [enter] detail  [/] filter  [s/S] sort" + sortInfo + "  [u] upgrade  [x] uninstall  [d] deps  [r] refresh  [q] quit")
 		default:
-			keys = StyleMuted.Render("[enter] detail  [/] filter  [s/S] sort" + sortInfo + "  [u] upgrade  [x] uninstall  [d] deps  [r] refresh  [q] quit")
+			keys = StyleMuted.Render("[enter] detail  [/] filter  [s/S] sort" + sortInfo + "  [r] refresh  [q] quit")
 		}
 	}
 
