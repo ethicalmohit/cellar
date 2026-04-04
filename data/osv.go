@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const osvAPI = "https://api.osv.dev/v1/query"
+const (
+	osvQueryAPI = "https://api.osv.dev/v1/query"
+	osvBatchAPI = "https://api.osv.dev/v1/querybatch"
+)
 
 type CVE struct {
 	ID       string
@@ -41,32 +44,60 @@ type osvResponse struct {
 	} `json:"vulns"`
 }
 
-var httpClient = &http.Client{Timeout: 10 * time.Second}
+type osvBatchRequest struct {
+	Queries []osvRequest `json:"queries"`
+}
 
-func QueryVulns(name, version string) ([]CVE, error) {
+type osvBatchResponse struct {
+	Results []osvResponse `json:"results"`
+}
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// QueryVulnsBatch sends a single POST /v1/querybatch request covering all
+// packages × ecosystems, replacing the previous O(N) sequential HTTP loop.
+// Returns a map of package name → CVEs found.
+func QueryVulnsBatch(pkgs []Package) map[string][]CVE {
+	if len(pkgs) == 0 {
+		return nil
+	}
 	ecosystems := []string{"Homebrew", "OSS-Fuzz"}
-	seen := map[string]bool{}
-	var cves []CVE
-
-	for _, eco := range ecosystems {
-		req := osvRequest{
-			Package: osvPackage{Name: name, Ecosystem: eco},
-			Version: version,
+	queries := make([]osvRequest, 0, len(pkgs)*len(ecosystems))
+	for _, p := range pkgs {
+		for _, eco := range ecosystems {
+			queries = append(queries, osvRequest{
+				Package: osvPackage{Name: p.Name, Ecosystem: eco},
+				Version: p.Version,
+			})
 		}
-		body, _ := json.Marshal(req)
-		resp, err := httpClient.Post(osvAPI, "application/json", bytes.NewReader(body))
-		if err != nil {
-			continue
-		}
-		var result osvResponse
-		json.NewDecoder(resp.Body).Decode(&result)
-		resp.Body.Close()
+	}
 
-		for _, v := range result.Vulns {
-			if seen[v.ID] {
+	body, _ := json.Marshal(osvBatchRequest{Queries: queries})
+	resp, err := httpClient.Post(osvBatchAPI, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var result osvBatchResponse
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	cveMap := make(map[string][]CVE)
+	seenIDs := make(map[string]map[string]bool)
+
+	for i, r := range result.Results {
+		if i >= len(queries) {
+			break
+		}
+		pkgName := queries[i].Package.Name
+		if seenIDs[pkgName] == nil {
+			seenIDs[pkgName] = make(map[string]bool)
+		}
+		for _, v := range r.Vulns {
+			if seenIDs[pkgName][v.ID] {
 				continue
 			}
-			seen[v.ID] = true
+			seenIDs[pkgName][v.ID] = true
 
 			severity := "unknown"
 			for _, s := range v.Severity {
@@ -81,7 +112,7 @@ func QueryVulns(name, version string) ([]CVE, error) {
 				url = v.References[0].URL
 			}
 
-			cves = append(cves, CVE{
+			cveMap[pkgName] = append(cveMap[pkgName], CVE{
 				ID:       v.ID,
 				Summary:  truncate(v.Summary, 80),
 				Severity: severity,
@@ -89,12 +120,10 @@ func QueryVulns(name, version string) ([]CVE, error) {
 			})
 		}
 	}
-	return cves, nil
+	return cveMap
 }
 
 func scoreSeverity(score string) string {
-	// CVSS score is like "CVSS:3.1/AV:N/AC:L/..." — extract base score from end
-	// Or it might be a plain float string
 	var f float64
 	fmt.Sscanf(score, "%f", &f)
 	switch {

@@ -1,6 +1,7 @@
 package data
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -69,23 +70,35 @@ func LoadApps() ([]App, error) {
 				Version: info.ShortVersion,
 				Build:   info.BundleVersion,
 				Path:    appPath,
-				Size:    appDirSize(appPath),
 			})
 		}
 	}
-	return apps, nil
-}
 
-func appDirSize(path string) int64 {
-	out, err := exec.Command("du", "-sk", path).Output()
-	if err != nil {
-		return 0
+	// Batch all .app sizes in a single du call instead of one subprocess per app.
+	if len(apps) > 0 {
+		args := make([]string, 0, len(apps)+1)
+		args = append(args, "-sk")
+		for _, a := range apps {
+			args = append(args, a.Path)
+		}
+		var buf bytes.Buffer
+		cmd := exec.Command("du", args...)
+		cmd.Stdout = &buf
+		cmd.Run() // partial output is fine
+		sizeByPath := make(map[string]int64, len(apps))
+		for _, line := range strings.Split(buf.String(), "\n") {
+			parts := strings.SplitN(line, "\t", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			var kb int64
+			fmt.Sscanf(parts[0], "%d", &kb)
+			sizeByPath[strings.TrimSpace(parts[1])] = kb * 1024
+		}
+		for i := range apps {
+			apps[i].Size = sizeByPath[apps[i].Path]
+		}
 	}
-	parts := strings.Fields(string(out))
-	if len(parts) == 0 {
-		return 0
-	}
-	var kb int64
-	fmt.Sscanf(parts[0], "%d", &kb)
-	return kb * 1024
+
+	return apps, nil
 }

@@ -69,8 +69,10 @@ type tabState struct {
 // Messages
 // ---------------------------------------------------------------------------
 
-type formulaeLoadedMsg []data.Package
-type casksLoadedMsg []data.Package
+type packagesLoadedMsg struct {
+	formulae []data.Package
+	casks    []data.Package
+}
 type appsLoadedMsg []data.App
 type servicesLoadedMsg []data.Service
 type tapsLoadedMsg []data.Tap
@@ -183,27 +185,19 @@ func New() Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, loadFormulae, loadCasks, loadApps, loadServices, loadTaps)
+	return tea.Batch(m.spinner.Tick, loadPackages, loadApps, loadServices, loadTaps)
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
-func loadFormulae() tea.Msg {
-	pkgs, err := data.LoadBrewFormulae()
+func loadPackages() tea.Msg {
+	formulae, casks, err := data.LoadBrewPackages()
 	if err != nil {
 		return errMsg{err}
 	}
-	return formulaeLoadedMsg(pkgs)
-}
-
-func loadCasks() tea.Msg {
-	pkgs, err := data.LoadBrewCasks()
-	if err != nil {
-		return casksLoadedMsg(nil)
-	}
-	return casksLoadedMsg(pkgs)
+	return packagesLoadedMsg{formulae: formulae, casks: casks}
 }
 
 func loadApps() tea.Msg {
@@ -232,14 +226,20 @@ func loadTaps() tea.Msg {
 
 func loadVulns(formulae, casks []data.Package) tea.Cmd {
 	return func() tea.Msg {
+		all := make([]data.Package, 0, len(formulae)+len(casks))
+		all = append(all, formulae...)
+		all = append(all, casks...)
+		cveMap := data.QueryVulnsBatch(all)
 		enrich := func(pkgs []data.Package) []data.Package {
-			for i, p := range pkgs {
-				if cves, err := data.QueryVulns(p.Name, p.Version); err == nil && len(cves) > 0 {
-					pkgs[i].CVEs = cves
-					pkgs[i].Vulnerable = true
+			result := make([]data.Package, len(pkgs))
+			copy(result, pkgs)
+			for i, p := range result {
+				if cves := cveMap[p.Name]; len(cves) > 0 {
+					result[i].CVEs = cves
+					result[i].Vulnerable = true
 				}
 			}
-			return pkgs
+			return result
 		}
 		return vulnsLoadedMsg{formulae: enrich(formulae), casks: enrich(casks)}
 	}
@@ -315,34 +315,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		cmds = append(cmds, cmd)
 
-	case formulaeLoadedMsg:
-		m.formulae = []data.Package(msg)
-		m.rebuildTables()
-		m.checkDoneLoading(&cmds)
-
-	case casksLoadedMsg:
-		m.casks = []data.Package(msg)
-		m.rebuildTables()
+	case packagesLoadedMsg:
+		m.formulae = msg.formulae
+		m.casks = msg.casks
+		m.rebuildFormulaeTable()
+		m.rebuildCasksTable()
+		m.rebuildVulnsTable()
 		m.checkDoneLoading(&cmds)
 
 	case appsLoadedMsg:
 		m.apps = []data.App(msg)
-		m.rebuildTables()
+		m.rebuildAppsTable()
 		m.checkDoneLoading(&cmds)
 
 	case servicesLoadedMsg:
 		m.services = []data.Service(msg)
-		m.rebuildTables()
+		m.rebuildServicesTable()
 
 	case tapsLoadedMsg:
 		m.taps = []data.Tap(msg)
-		m.rebuildTables()
+		m.rebuildTapsTable()
 
 	case vulnsLoadedMsg:
 		m.formulae = msg.formulae
 		m.casks = msg.casks
 		m.vulnsLoading = false
-		m.rebuildTables()
+		m.rebuildFormulaeTable()
+		m.rebuildCasksTable()
+		m.rebuildVulnsTable()
 		m.vTable.Focus()
 
 	case depsLoadedMsg:
@@ -370,7 +370,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeNormal
 		m.loading = true
-		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks))
+		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadPackages))
 
 	case uninstallDoneMsg:
 		if msg.err != nil {
@@ -380,7 +380,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeNormal
 		m.loading = true
-		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks))
+		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadPackages))
 
 	case serviceActionDoneMsg:
 		if msg.err != nil {
@@ -408,7 +408,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeNormal
 		m.loading = true
-		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks))
+		cmds = append(cmds, tea.Batch(m.spinner.Tick, loadPackages))
 
 	case errMsg:
 		m.err = msg.err
@@ -467,7 +467,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 			var cmd tea.Cmd
 			m.filterInput, cmd = m.filterInput.Update(msg)
 			m.tabStates[m.activeTab].filter = m.filterInput.Value()
-			m.rebuildTables()
+			m.rebuildActiveTable()
 			cmds = append(cmds, cmd)
 		}
 
@@ -579,7 +579,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 			m.vulnsLoading = false
 			m.actionMsg = ""
 			m.err = nil
-			cmds = append(cmds, tea.Batch(m.spinner.Tick, loadFormulae, loadCasks, loadApps, loadServices, loadTaps))
+			cmds = append(cmds, tea.Batch(m.spinner.Tick, loadPackages, loadApps, loadServices, loadTaps))
 		case "/":
 			m.mode = modeFilter
 			m.filterInput.SetValue(m.tabStates[m.activeTab].filter)
@@ -588,7 +588,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 		case "esc":
 			m.tabStates[m.activeTab].filter = ""
 			m.filterInput.SetValue("")
-			m.rebuildTables()
+			m.rebuildActiveTable()
 		case "s":
 			st := &m.tabStates[m.activeTab]
 			max := m.maxSortCol()
@@ -598,11 +598,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) []tea.Cmd {
 				st.sortCol++
 				st.sortAsc = true
 			}
-			m.rebuildTables()
+			m.rebuildActiveTable()
 		case "S":
 			if st := &m.tabStates[m.activeTab]; st.sortCol >= 0 {
 				st.sortAsc = !st.sortAsc
-				m.rebuildTables()
+				m.rebuildActiveTable()
 			}
 		case "enter":
 			if m.activeTab == tabServices {
@@ -779,20 +779,73 @@ func (m *Model) tableHeight() int {
 	return h
 }
 
-func (m *Model) rebuildTables() {
-	th := m.tableHeight()
-	cw := m.width - 4
+func (m *Model) dims() (cw, th int) {
+	th = m.tableHeight()
+	cw = m.width - 4
 	if cw < 60 {
 		cw = 60
 	}
+	return
+}
 
+func (m *Model) rebuildFormulaeTable() {
+	cw, th := m.dims()
 	m.fTable = buildPackageTable(filteredPkgs(m.formulae, m.tabStates[tabFormulae].filter), cw, th, m.tabStates[tabFormulae].sortCol, m.tabStates[tabFormulae].sortAsc)
-	m.cTable = buildPackageTable(filteredPkgs(m.casks, m.tabStates[tabCasks].filter), cw, th, m.tabStates[tabCasks].sortCol, m.tabStates[tabCasks].sortAsc)
-	m.aTable = buildAppTable(filteredApps(m.apps, m.tabStates[tabApps].filter), cw, th, m.tabStates[tabApps].sortCol, m.tabStates[tabApps].sortAsc)
-	m.vTable = buildVulnTable(filteredPkgs(m.formulae, m.tabStates[tabVulns].filter), filteredPkgs(m.casks, m.tabStates[tabVulns].filter), cw, th, m.tabStates[tabVulns].sortCol, m.tabStates[tabVulns].sortAsc)
-	m.svcTable = buildServiceTable(filteredServices(m.services, m.tabStates[tabServices].filter), cw, th, m.tabStates[tabServices].sortCol, m.tabStates[tabServices].sortAsc)
-	m.tTable = buildTapTable(filteredTaps(m.taps, m.tabStates[tabTaps].filter), cw, th, m.tabStates[tabTaps].sortCol, m.tabStates[tabTaps].sortAsc)
+}
 
+func (m *Model) rebuildCasksTable() {
+	cw, th := m.dims()
+	m.cTable = buildPackageTable(filteredPkgs(m.casks, m.tabStates[tabCasks].filter), cw, th, m.tabStates[tabCasks].sortCol, m.tabStates[tabCasks].sortAsc)
+}
+
+func (m *Model) rebuildAppsTable() {
+	cw, th := m.dims()
+	m.aTable = buildAppTable(filteredApps(m.apps, m.tabStates[tabApps].filter), cw, th, m.tabStates[tabApps].sortCol, m.tabStates[tabApps].sortAsc)
+}
+
+func (m *Model) rebuildVulnsTable() {
+	cw, th := m.dims()
+	m.vTable = buildVulnTable(filteredPkgs(m.formulae, m.tabStates[tabVulns].filter), filteredPkgs(m.casks, m.tabStates[tabVulns].filter), cw, th, m.tabStates[tabVulns].sortCol, m.tabStates[tabVulns].sortAsc)
+}
+
+func (m *Model) rebuildServicesTable() {
+	cw, th := m.dims()
+	m.svcTable = buildServiceTable(filteredServices(m.services, m.tabStates[tabServices].filter), cw, th, m.tabStates[tabServices].sortCol, m.tabStates[tabServices].sortAsc)
+}
+
+func (m *Model) rebuildTapsTable() {
+	cw, th := m.dims()
+	m.tTable = buildTapTable(filteredTaps(m.taps, m.tabStates[tabTaps].filter), cw, th, m.tabStates[tabTaps].sortCol, m.tabStates[tabTaps].sortAsc)
+}
+
+// rebuildActiveTable rebuilds only the table for the currently visible tab.
+// Used for filter/sort key events where only the active tab's data changes.
+func (m *Model) rebuildActiveTable() {
+	switch m.activeTab {
+	case tabFormulae:
+		m.rebuildFormulaeTable()
+	case tabCasks:
+		m.rebuildCasksTable()
+	case tabApps:
+		m.rebuildAppsTable()
+	case tabVulns:
+		m.rebuildVulnsTable()
+	case tabServices:
+		m.rebuildServicesTable()
+	case tabTaps:
+		m.rebuildTapsTable()
+	}
+}
+
+// rebuildTables rebuilds all tables and the viewport — used only on window resize.
+func (m *Model) rebuildTables() {
+	m.rebuildFormulaeTable()
+	m.rebuildCasksTable()
+	m.rebuildAppsTable()
+	m.rebuildVulnsTable()
+	m.rebuildServicesTable()
+	m.rebuildTapsTable()
+	cw, th := m.dims()
 	if m.depsContent != "" {
 		m.depsViewport.Width = cw
 		m.depsViewport.Height = th
